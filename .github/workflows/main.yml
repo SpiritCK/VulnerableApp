@@ -1,0 +1,86 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the action will run. Triggers the workflow on push or pull request
+# events but only for the master branch
+on:
+  push:
+    branches: [ master ]
+    paths-ignore: [ '.github/**' ]
+  pull_request:
+    branches: [ master ]
+    paths-ignore: [ '.github/**' ]
+    
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  scan:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v2
+
+      - name: Run Secrets Scan
+        uses: Azure/powershell@v1
+        with:
+          # Specify the Az PowerShell script here.
+          inlineScript: |
+            # Parameters for user to update
+            [string]$repoUrl = 'https://github.com/devsecurityops/VulnerableApp.git' # git clone url
+            [string]$authToken = '${{ secrets.API_TOKEN }}' # update with your organisation's authentication token
+
+            # Contant values
+            $baseUrl = 'https://api.dvuln.com/beta/v1'
+
+            $headers = @{ 'Authorization' = $authToken; 'Accept' = 'application/json'; 'Content-Type' = 'application/json' }
+            $body = @{ 'repoUrl' = $repoUrl; }
+
+            Write-Host "Submitting scan request..."
+            $res = Invoke-WebRequest -Uri ([uri]::new("$baseUrl/scan/secrets")) -Method Post -Headers $headers -Body (ConvertTo-Json $body)
+            if ($res.StatusCode -eq 200) {
+                $resContent = ConvertFrom-Json $res.Content
+                if ($resContent.scanId) {
+                    $scanId = $resContent.scanId
+                    $completedScans = $resContent.completedScans
+                    $scansRemaining = $resContent.scansRemaining
+                    Write-Host "Request successful. Scan $scanId is currently IN_PROGRESS."
+                    Write-Host "- To get the scan status, perform GET $baseUrl/scan/$scanId"
+                    Write-Host "- Once COMPLETED, to get the result perform GET $baseUrl/scan/$scanId/issues"
+                    Write-Host "There are currently $completedScans completed scans and there are $scansRemaining scans remaining for your organisation to use"
+
+                    Write-Host "##vso[task.setvariable variable=scanId]$scanId" # Assign scanId runtime variable in Azure DevOps
+                }
+            }
+            
+      - name: Poll Scan Result
+        uses: Azure/powershell@v1
+        with:
+          # Specify the Az PowerShell script here.
+          inlineScript: |
+            # Parameters for user to update
+            [guid]$scanId = '$env:scanId' # [guid] retrieve scanId value from POST /scan/sast or /scan/secrets response
+            [string]$authToken = '${{ secrets.API_TOKEN }}' # [hash] update with your organisation's authentication token
+            [string]$reportFilename = '$(Build.ArtifactStagingDirectory)/scan-result.json' # [string] update with report filename or full path. The result is in JSON format.
+
+            # Contant values
+            $baseUrl = 'https://api.dvuln.com/beta/v1'
+            $timeout = New-TimeSpan -Minutes 15
+
+            $headers = @{ 'Authorization' = $authToken; 'Accept' = 'application/json'; 'Content-Length' = 0 }
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($sw.elapsed -lt $timeout){
+                $res = Invoke-WebRequest -Uri ([uri]::new("$baseUrl/scan/$scanId")) -Method Get -Headers $headers
+                if ($res.StatusCode -eq 200 -and (ConvertFrom-Json $res.Content).status -eq "COMPLETED") {
+                    Write-Host "Scan has been completed. Retrieving Result..."
+                    Invoke-WebRequest -Uri ([uri]::new("$baseUrl/scan/$scanId/issues")) -Method Get -Headers $headers -OutFile $reportFilename
+                    Write-Host "Result has been written to $reportFilename"
+                    return
+                }
+                Write-Host "Waiting for scan to complete..."
+                Start-Sleep -Seconds 180
+            }
